@@ -1,6 +1,8 @@
 <?php
 namespace Server;
+
 use Noodlehaus\Exception;
+use Server\Client\Client;
 use Server\CoreBase\ControllerFactory;
 use Server\CoreBase\Loader;
 use Server\CoreBase\SwooleException;
@@ -9,7 +11,8 @@ use Server\DataBase\MysqlAsynPool;
 use Server\DataBase\RedisAsynPool;
 use Server\Pack\IPack;
 use Server\Route\IRoute;
-
+define("SERVER_DIR", __DIR__);
+define("APP_DIR", __DIR__ . "/../app");
 /**
  * Created by PhpStorm.
  * User: tmtbe
@@ -91,6 +94,11 @@ class SwooleDistributedServer extends SwooleHttpServer
     protected $pool_process;
 
     /**
+     * 各种client
+     * @var Client
+     */
+    public $client;
+    /**
      * SwooleDistributedServer constructor.
      */
     public function __construct()
@@ -98,10 +106,30 @@ class SwooleDistributedServer extends SwooleHttpServer
         self::$instance =& $this;
         parent::__construct();
         $this->loader = new Loader();
-        $pack_class_name = "\\Server\\Pack\\" . $this->config['server']['pack_tool'];
-        $this->pack = new $pack_class_name;
-        $route_class_name = "\\Server\\Route\\" . $this->config['server']['route_tool'];
-        $this->route = new $route_class_name;
+        //pack class
+        $pack_class_name = "\\app\\Pack\\" . $this->config['server']['pack_tool'];
+        if (class_exists($pack_class_name)) {
+            $this->pack = new $pack_class_name;
+        }else{
+            $pack_class_name = "\\Server\\Pack\\" . $this->config['server']['pack_tool'];
+            if (class_exists($pack_class_name)) {
+                $this->pack = new $pack_class_name;
+            }else{
+                throw new SwooleException("class {$this->config['server']['pack_tool']} is not exist.");
+            }
+        }
+        //route class
+        $route_class_name = "\\app\\Route\\" . $this->config['server']['route_tool'];
+        if (class_exists($route_class_name)) {
+            $this->route = new $route_class_name;
+        }else{
+            $route_class_name = "\\Server\\Route\\" . $this->config['server']['route_tool'];
+            if (class_exists($route_class_name)) {
+                $this->route = new $route_class_name;
+            }else{
+                throw new SwooleException("class {$this->config['server']['route_tool']} is not exist.");
+            }
+        }
     }
 
     /**
@@ -127,7 +155,7 @@ class SwooleDistributedServer extends SwooleHttpServer
      */
     public function setServerSet()
     {
-        $set = $this->config->get('server.set',[]);
+        $set = $this->config->get('server.set', []);
         $set = array_merge($set, $this->probuf_set);
         return $set;
     }
@@ -247,6 +275,8 @@ class SwooleDistributedServer extends SwooleHttpServer
         $fd = $this->dispatchClientFds[array_rand($this->dispatchClientFds)];
         if ($fd != null) {
             $this->server->send($fd, $this->encode($send_data));
+        }else{
+            $this->server->task($send_data);
         }
     }
 
@@ -281,12 +311,25 @@ class SwooleDistributedServer extends SwooleHttpServer
                     $serv->send($fd, $message['data']);
                 }
                 return null;
+            case SwooleMarco::MSG_TYPE_SEND_GROUP://群组
+                $uids = $this->redis_client->hGetAll(SwooleMarco::redis_group_hash_name_prefix . $message['groupId']);
+                foreach ($uids as $uid){
+                    if ($this->uid_fd_table->exist($uid)) {
+                        $fd = $this->uid_fd_table->get($uid)['fd'];
+                        $this->server->send($fd, $message['data']);
+                    }
+                }
+                return null;
             case SwooleMarco::SERVER_TYPE_TASK://task任务
                 $task_name = $message['task_name'];
                 $task = $this->loader->task($task_name);
                 $task_fuc_name = $message['task_fuc_name'];
                 $task_data = $message['task_fuc_data'];
-                $result = call_user_func_array(array($task, $task_fuc_name), $task_data);
+                if(method_exists($task, $task_fuc_name)) {
+                    $result = call_user_func_array(array($task, $task_fuc_name), $task_data);
+                }else{
+                    throw new SwooleException("method $task_fuc_name not exist in $task_name");
+                }
                 $task->distory();
                 return $result;
             default:
@@ -316,6 +359,8 @@ class SwooleDistributedServer extends SwooleHttpServer
             }
             $this->asnyPoolManager->registAsyn($this->redis_pool);
             $this->asnyPoolManager->registAsyn($this->mysql_pool);
+            //初始化异步Client
+            $this->client = new Client();
         }
         //定时器
         if ($workerId == $this->worker_num - 1) {//最后一个worker处理启动定时器
@@ -393,9 +438,14 @@ class SwooleDistributedServer extends SwooleHttpServer
         if ($controller_instance != null) {
             $uid = $serv->connection_info($fd)['uid']??0;
             $controller_instance->setClientData($uid, $fd, $client_data);
-            $methd_name = $this->route->getMethodName();
-            if (method_exists($controller_instance, $methd_name)) {
-                call_user_func([$controller_instance, $methd_name]);
+            $methd_name = $this->config->get('tcp.method_prefix','').$this->route->getMethodName();
+            try{
+                $generator = call_user_func([$controller_instance, $methd_name]);
+                if($generator instanceof \Generator){
+                    $this->coroutine->start($generator);
+                }
+            }catch (\Exception $e){
+                
             }
         }
     }
@@ -407,15 +457,27 @@ class SwooleDistributedServer extends SwooleHttpServer
      */
     public function onSwooleRequest($request, $response)
     {
+        $error_404 = false;
         $this->route->handleClientRequest($request);
         $controller_name = $this->route->getControllerName();
         $controller_instance = ControllerFactory::getInstance()->getController($controller_name);
         if ($controller_instance != null) {
-            $controller_instance->setRequestResponse($request,$response);
-            $methd_name = $this->route->getMethodName();
+            $controller_instance->setRequestResponse($request, $response);
+            $methd_name = $this->config->get('http.method_prefix','').$this->route->getMethodName();
             if (method_exists($controller_instance, $methd_name)) {
-                call_user_func([$controller_instance, $methd_name]);
+                $generator = call_user_func([$controller_instance, $methd_name]);
+                if($generator instanceof \Generator){
+                    $this->coroutine->start($generator);
+                }
+            } else {
+                $error_404 = true;
             }
+        } else {
+            $error_404 = true;
+        }
+        if ($error_404) {
+            $template = $this->loader->view('server::error_404');
+            $response->end($template->render(['controller' => $request->server['path_info'], 'message' => '页面不存在！']));
         }
     }
 

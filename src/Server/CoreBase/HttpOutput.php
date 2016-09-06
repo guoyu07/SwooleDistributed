@@ -71,10 +71,9 @@ class HttpOutput{
      * Set Content-Type Header
      *
      * @param    string $mime_type Extension of the file we're outputting
-     * @param    string $charset Character set (default: NULL)
      * @return    HttpOutPut
      */
-    public function set_content_type($mime_type, $charset = NULL)
+    public function set_content_type($mime_type)
     {
         $this->set_header('Content-Type', $mime_type);
         return $this;
@@ -102,5 +101,19 @@ class HttpOutput{
             $this->controller->destroy();
         }
         return;
+    }
+
+    /**
+     * 输出文件（会自动销毁）
+     * @param $root_file
+     * @param $file_name
+     * @return bool
+     */
+    public function endFile($root_file,$file_name){
+        $result = swoole_async_readfile($root_file.'/'.$file_name, function($filename, $content) {
+            $this->response->end($content);
+            $this->controller->destroy();
+        });
+        return $result;
     }
 }

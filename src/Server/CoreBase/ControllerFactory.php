@@ -1,5 +1,7 @@
 <?php
 namespace Server\CoreBase;
+use app\Controllers\Account;
+
 /**
  * 控制器工厂模式
  * Created by PhpStorm.
@@ -38,6 +40,7 @@ class ControllerFactory
      * @param $controller string
      */
     public function getController($controller){
+        if($controller==null) return null;
         if(!key_exists($controller, $this->pool)){
             $this->pool[$controller] = new \SplQueue();
         }
@@ -46,13 +49,20 @@ class ControllerFactory
             $controller_instance->reUse();
             return $controller_instance;
         }
-        $class_name = "\\Server\\Controllers\\$controller";
+        $class_name = "\\app\\Controllers\\$controller";
         if(class_exists($class_name)) {
             $controller_instance = new $class_name;
             $controller_instance->core_name = $controller;
             return $controller_instance;
-        }else{
-            return null;
+        }else {
+            $class_name = "\\Server\\Controllers\\$controller";
+            if (class_exists($class_name)) {
+                $controller_instance = new $class_name;
+                $controller_instance->core_name = $controller;
+                return $controller_instance;
+            } else {
+                return null;
+            }
         }
     }
 
